@@ -54,7 +54,7 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | grep "package: name='com.sahidcode404.camera'"
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | grep "sdkVersion:'23'"
           CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr '[:upper:]' '[:lower:]')
-          test "$CERT_SHA" = "9dde8fe35506ba993a5b8ffba8f01ff46d35c86419ba8fd5029d187b3f6fbd8c"
+          test "$CERT_SHA" = "5bc768a38b0f8522d6dc6a6dc434658f3d74337cc72bb4abb837b9e8018be7ef"
 
       - name: Package rolling development OTA
         shell: bash
@@ -72,7 +72,7 @@ jobs:
             "minSdk": 23,
             "assetName": "Camera-dev.apk",
             "sha256": "${SHA}",
-            "signerSha256": "9dde8fe35506ba993a5b8ffba8f01ff46d35c86419ba8fd5029d187b3f6fbd8c",
+            "signerSha256": "5bc768a38b0f8522d6dc6a6dc434658f3d74337cc72bb4abb837b9e8018be7ef",
             "sourceSha": "${GITHUB_SHA}",
             "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }

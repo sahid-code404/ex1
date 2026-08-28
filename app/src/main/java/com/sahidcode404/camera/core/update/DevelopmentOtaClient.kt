@@ -170,6 +170,6 @@ class DevelopmentOtaClient(
     companion object {
         private const val MANIFEST_URL = "https://github.com/sahid-code404/ex1/releases/download/dev-latest/dev-manifest.json"
         private const val APK_URL = "https://github.com/sahid-code404/ex1/releases/download/dev-latest/Camera-dev.apk"
-        private const val DEV_SIGNER_SHA256 = "9dde8fe35506ba993a5b8ffba8f01ff46d35c86419ba8fd5029d187b3f6fbd8c"
+        private const val DEV_SIGNER_SHA256 = "5bc768a38b0f8522d6dc6a6dc434658f3d74337cc72bb4abb837b9e8018be7ef"
     }
 }
