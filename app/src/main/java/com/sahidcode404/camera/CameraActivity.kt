@@ -338,7 +338,7 @@ class CameraActivity : AppCompatActivity(), Camera2Controller.Listener {
         }
     }
 
-    override fun onPreviewCaptureState(exposureNs: Long?, iso: Int?) = Unit
+    override fun onPreviewCaptureState(exposureNs: Long?, iso: Int?, focalLengthMm: Float?) = Unit
 
     override fun onRawPreviewFrame() {
         releaseFirstFrameGate()
