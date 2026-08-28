@@ -1,0 +1,104 @@
+name: Camera CI + Development OTA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: camera-development-ota
+  cancel-in-progress: false
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CAMERA_VERSION_CODE: ${{ github.run_number }}
+      CAMERA_VERSION_NAME: 0.1.${{ github.run_number }}-dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Unit tests and release APK
+        run: gradle --no-daemon :app:testReleaseUnitTest :app:assembleRelease
+
+      - name: Verify API 23 package identity and signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | grep "package: name='com.sahidcode404.camera'"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | grep "sdkVersion:'23'"
+          CERT_SHA=$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr '[:upper:]' '[:lower:]')
+          test "$CERT_SHA" = "9dde8fe35506ba993a5b8ffba8f01ff46d35c86419ba8fd5029d187b3f6fbd8c"
+
+      - name: Package rolling development OTA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp app/build/outputs/apk/release/app-release.apk Camera-dev.apk
+          SHA=$(sha256sum Camera-dev.apk | awk '{print $1}')
+          cat > dev-manifest.json <<EOF
+          {
+            "schema": 1,
+            "channel": "development",
+            "packageName": "com.sahidcode404.camera",
+            "versionCode": ${CAMERA_VERSION_CODE},
+            "versionName": "${CAMERA_VERSION_NAME}",
+            "minSdk": 23,
+            "assetName": "Camera-dev.apk",
+            "sha256": "${SHA}",
+            "signerSha256": "9dde8fe35506ba993a5b8ffba8f01ff46d35c86419ba8fd5029d187b3f6fbd8c",
+            "sourceSha": "${GITHUB_SHA}",
+            "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Camera-development-${{ github.run_number }}
+          path: |
+            Camera-dev.apk
+            dev-manifest.json
+          if-no-files-found: error
+
+      - name: Publish rolling dev-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view dev-latest >/dev/null 2>&1; then
+            git tag -f dev-latest "$GITHUB_SHA"
+            git push origin refs/tags/dev-latest --force
+            # APK first, manifest last: a replacement window fails closed by SHA mismatch.
+            gh release upload dev-latest Camera-dev.apk --clobber
+            gh release upload dev-latest dev-manifest.json --clobber
+            gh release edit dev-latest --title "Camera Development" --notes "Automatic development OTA from ${GITHUB_SHA}."
+          else
+            gh release create dev-latest Camera-dev.apk dev-manifest.json --prerelease --title "Camera Development" --notes "Automatic development OTA from ${GITHUB_SHA}." --target "$GITHUB_SHA"
+          fi
