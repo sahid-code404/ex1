@@ -6,7 +6,6 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Build
-import android.util.Size
 import com.sahidcode404.camera.core.model.CameraRoute
 import com.sahidcode404.camera.core.model.CanonicalLens
 import com.sahidcode404.camera.core.model.LensFacing
@@ -20,9 +19,43 @@ class UniversalCameraDiscoverer(context: Context) {
 
     fun publicIds(): List<String> = manager.cameraIdList.toList()
 
+    /**
+     * First-install bootstrap path. It intentionally inspects only public Camera2 routes and skips
+     * RAW stream enumeration plus logical/physical AUX expansion. The goal is to get one credible
+     * preview on screen before the expensive topology pass.
+     */
+    fun discoverStartupSeed(): List<CanonicalLens> {
+        val ids = boundedPublicIds()
+        return ids.mapNotNull { id ->
+            readRoute(
+                openId = id,
+                physicalId = null,
+                kind = RouteKind.PUBLIC,
+                includeRawStreams = false,
+            )
+        }
+            .map(::lensForSingleRoute)
+            .sortedWith(
+                compareBy<CanonicalLens>(
+                    { facingOrder(it.facing) },
+                    { representativeFocal(it.preferredRoute) },
+                    { it.id },
+                ),
+            )
+            .let(::deduplicateLabels)
+    }
+
+    /** Full post-first-frame topology and RAW capability discovery. */
     fun discover(): List<CanonicalLens> {
-        val publicIds = publicIds()
-        val publicRoutes = publicIds.mapNotNull { id -> readRoute(id, null, RouteKind.PUBLIC) }
+        val publicIds = boundedPublicIds()
+        val publicRoutes = publicIds.mapNotNull { id ->
+            readRoute(
+                openId = id,
+                physicalId = null,
+                kind = RouteKind.PUBLIC,
+                includeRawStreams = true,
+            )
+        }
         val physicalByParent = linkedMapOf<String, MutableList<CameraRoute>>()
 
         if (Build.VERSION.SDK_INT >= 28) {
@@ -30,8 +63,16 @@ class UniversalCameraDiscoverer(context: Context) {
                 val characteristics = runCatching { manager.getCameraCharacteristics(parent) }.getOrNull() ?: continue
                 val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
                 if (!capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)) continue
-                for (physicalId in characteristics.physicalCameraIds) {
-                    val route = readRoute(parent, physicalId, RouteKind.LOGICAL_PHYSICAL) ?: continue
+
+                val physicalIds = characteristics.physicalCameraIds
+                if (physicalIds.size > MAX_PHYSICAL_IDS_PER_LOGICAL) continue
+                for (physicalId in physicalIds) {
+                    val route = readRoute(
+                        openId = parent,
+                        physicalId = physicalId,
+                        kind = RouteKind.LOGICAL_PHYSICAL,
+                        includeRawStreams = true,
+                    ) ?: continue
                     physicalByParent.getOrPut(parent) { mutableListOf() }.add(route)
                 }
             }
@@ -58,6 +99,8 @@ class UniversalCameraDiscoverer(context: Context) {
                         add(directDuplicate)
                         consumedDirectIds += directDuplicate.openId
                     }
+                    // Keep the logical/public route as a capability fallback. This is especially
+                    // important on devices whose physical route rejects a requested stream combo.
                     add(publicRoute)
                 }.distinctBy { it.routeKey }
                 result += CanonicalLens(
@@ -75,6 +118,12 @@ class UniversalCameraDiscoverer(context: Context) {
             .let(::deduplicateLabels)
     }
 
+    private fun boundedPublicIds(): List<String> {
+        val ids = publicIds()
+        check(ids.size <= MAX_PUBLIC_IDS) { "Camera2 advertised more than $MAX_PUBLIC_IDS public IDs" }
+        return ids
+    }
+
     private fun lensForSingleRoute(route: CameraRoute) = CanonicalLens(
         id = stableId("lens|${route.opticalFingerprint}|${route.routeKey}"),
         label = opticalLabel(route),
@@ -82,29 +131,49 @@ class UniversalCameraDiscoverer(context: Context) {
         routes = listOf(route),
     )
 
-    private fun readRoute(openId: String, physicalId: String?, kind: RouteKind): CameraRoute? {
+    private fun readRoute(
+        openId: String,
+        physicalId: String?,
+        kind: RouteKind,
+        includeRawStreams: Boolean,
+    ): CameraRoute? {
         val metadataId = physicalId ?: openId
         val c = runCatching { manager.getCameraCharacteristics(metadataId) }.getOrNull() ?: return null
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
         val previewSizes = runCatching { map.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty() }
             .getOrDefault(emptyList())
+            .asSequence()
             .filter { it.width > 0 && it.height > 0 }
             .distinct()
-        if (previewSizes.isEmpty()) return null
+            .take(MAX_PREVIEW_SIZES + 1)
+            .toList()
+        if (previewSizes.isEmpty() || previewSizes.size > MAX_PREVIEW_SIZES) return null
 
         val available = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
         val rawAdvertised = available.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
-        val rawSizes = if (rawAdvertised) {
+        val rawSizes = if (includeRawStreams && rawAdvertised) {
             runCatching { map.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty() }
                 .getOrDefault(emptyList())
+                .asSequence()
                 .filter { it.width > 0 && it.height > 0 }
                 .distinct()
-        } else emptyList()
+                .take(MAX_RAW_SIZES + 1)
+                .toList()
+                .takeIf { it.size <= MAX_RAW_SIZES }
+                ?: emptyList()
+        } else {
+            emptyList()
+        }
 
         val focal = (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: floatArrayOf())
+            .asSequence()
             .filter { it.isFinite() && it > 0f }
             .distinct()
             .sorted()
+            .take(MAX_FOCAL_LENGTHS + 1)
+            .toList()
+        if (focal.size > MAX_FOCAL_LENGTHS) return null
+
         val physical = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val orientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         val manual = available.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
@@ -155,7 +224,7 @@ class UniversalCameraDiscoverer(context: Context) {
     private fun opticalLabel(route: CameraRoute): String {
         val focal = representativeFocal(route)
         val sensorWidth = route.sensorPhysicalWidthMm
-        return if (focal > 0f && sensorWidth != null && sensorWidth > 0f) {
+        return if (focal > 0f && focal.isFinite() && sensorWidth != null && sensorWidth > 0f) {
             val equivalent = (focal * 36f / sensorWidth).roundToInt().coerceAtLeast(1)
             when (route.facing) {
                 LensFacing.FRONT -> "Front ${equivalent}mm"
@@ -192,6 +261,12 @@ class UniversalCameraDiscoverer(context: Context) {
     }
 
     companion object {
+        private const val MAX_PUBLIC_IDS = 64
+        private const val MAX_PHYSICAL_IDS_PER_LOGICAL = 64
+        private const val MAX_FOCAL_LENGTHS = 16
+        private const val MAX_PREVIEW_SIZES = 128
+        private const val MAX_RAW_SIZES = 64
+
         fun stableId(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray(Charsets.UTF_8))
             .take(12)

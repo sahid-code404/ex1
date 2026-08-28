@@ -23,6 +23,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.sahidcode404.camera.core.discovery.LensCache
+import com.sahidcode404.camera.core.discovery.TopologyReconciler
 import com.sahidcode404.camera.core.discovery.UniversalCameraDiscoverer
 import com.sahidcode404.camera.core.model.AspectMode
 import com.sahidcode404.camera.core.model.CameraRoute
@@ -63,6 +64,7 @@ class CameraActivity : AppCompatActivity(), Camera2Controller.Listener {
     private var firstFrameReleased = false
     private var deepDiscoveryStarted = false
     private var pendingCaptureAfterReopen = false
+    private var latestFocalLengthMm: Float? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -142,12 +144,15 @@ class CameraActivity : AppCompatActivity(), Camera2Controller.Listener {
             statusView.text = "Cached lenses ready"
             return
         }
-        statusView.text = "Discovering camera lenses"
+
+        // First install must not block visible preview on RAW stream scans or logical/physical AUX
+        // reconciliation. Seed only the public preview routes, then do the complete topology pass
+        // after the first real frame has reached the UI.
+        statusView.text = "Preparing camera"
         discoveryExecutor.execute {
-            val discovered = runCatching { discoverer.discover() }.getOrElse { emptyList() }
-            if (discovered.isNotEmpty()) cache.save(ids, discovered)
+            val seed = runCatching { discoverer.discoverStartupSeed() }.getOrElse { emptyList() }
             runOnUiThread {
-                if (discovered.isEmpty()) statusView.text = "No usable camera route found" else setLenses(discovered)
+                if (seed.isEmpty()) statusView.text = "No usable camera route found" else setLenses(seed)
             }
         }
     }
@@ -195,9 +200,17 @@ class CameraActivity : AppCompatActivity(), Camera2Controller.Listener {
                 if (full.isNotEmpty()) {
                     cache.save(ids, full)
                     runOnUiThread {
-                        // Refresh the lens bar without disrupting the currently visible session.
+                        // Rebind canonical identity and lens controls to the rich topology while the
+                        // already-open Camera2 session continues streaming. Do not reopen here.
+                        activeLens = TopologyReconciler.reconcileVisibleLens(
+                            currentLens = activeLens,
+                            openedRoute = openedRoute,
+                            observedFocalLengthMm = latestFocalLengthMm,
+                            fullTopology = full,
+                        ) ?: activeLens
                         lenses = full
                         rebuildLensRow()
+                        updatePreviewBounds()
                     }
                 }
             }
@@ -338,7 +351,9 @@ class CameraActivity : AppCompatActivity(), Camera2Controller.Listener {
         }
     }
 
-    override fun onPreviewCaptureState(exposureNs: Long?, iso: Int?, focalLengthMm: Float?) = Unit
+    override fun onPreviewCaptureState(exposureNs: Long?, iso: Int?, focalLengthMm: Float?) {
+        latestFocalLengthMm = focalLengthMm
+    }
 
     override fun onRawPreviewFrame() {
         releaseFirstFrameGate()
