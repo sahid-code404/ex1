@@ -5,7 +5,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
-import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -25,11 +24,11 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
 import android.widget.ImageView
 import com.sahidcode404.camera.core.model.AspectMode
 import com.sahidcode404.camera.core.model.CameraRoute
 import com.sahidcode404.camera.core.model.CanonicalLens
-import com.sahidcode404.camera.core.model.LensFacing
 import com.sahidcode404.camera.core.model.PreviewMode
 import com.sahidcode404.camera.core.preview.PreviewGeometry
 import com.sahidcode404.camera.core.raw.BurstMemoryBudget
@@ -50,7 +49,7 @@ class Camera2Controller(
 ) {
     interface Listener {
         fun onRouteOpened(lens: CanonicalLens, route: CameraRoute)
-        fun onPreviewCaptureState(exposureNs: Long?, iso: Int?)
+        fun onPreviewCaptureState(exposureNs: Long?, iso: Int?, focalLengthMm: Float?)
         fun onRawPreviewFrame()
         fun onCaptureStarted(frameCount: Int)
         fun onCaptureCompleted(uri: android.net.Uri, acceptedFrames: Int)
@@ -69,7 +68,9 @@ class Camera2Controller(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cameraThread = HandlerThread("CameraOwner").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
-    private val processing = Executors.newSingleThreadExecutor { r -> Thread(r, "RawProcessing").apply { priority = Thread.NORM_PRIORITY - 1 } }
+    private val processing = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RawProcessing").apply { priority = Thread.NORM_PRIORITY - 1 }
+    }
     private val sessionExecutor = Executor { command -> cameraHandler.post(command) }
 
     private var generation = 0L
@@ -77,7 +78,6 @@ class Camera2Controller(
     private var session: CameraCaptureSession? = null
     private var rawReader: ImageReader? = null
     private var previewSurface: Surface? = null
-    private var activeLens: CanonicalLens? = null
     private var activeRoute: CameraRoute? = null
     private var textureView: TextureView? = null
     private var rawPreviewView: ImageView? = null
@@ -110,7 +110,6 @@ class Camera2Controller(
             generation += 1
             val token = generation
             closeOwned()
-            activeLens = lens
             textureView = texture
             rawPreviewView = rawView
             previewMode = mode
@@ -170,9 +169,13 @@ class Camera2Controller(
                 currentDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     addTarget(reader.surface)
                     if (previewMode == PreviewMode.API) previewSurface?.let(::addTarget)
-                    if (route.supportsManualSensor && baseExposure != null && baseIso != null && exposureRange != null && isoRange != null) {
+                    if (
+                        route.supportsManualSensor && baseExposure != null && baseIso != null &&
+                        exposureRange != null && isoRange != null
+                    ) {
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                        val scaled = (baseExposure * 2.0.pow(ev.toDouble())).toLong().coerceIn(exposureRange.lower, exposureRange.upper)
+                        val scaled = (baseExposure * 2.0.pow(ev.toDouble())).toLong()
+                            .coerceIn(exposureRange.lower, exposureRange.upper)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, scaled)
                         set(CaptureRequest.SENSOR_SENSITIVITY, baseIso.coerceIn(isoRange.lower, isoRange.upper))
                     } else {
@@ -181,9 +184,8 @@ class Camera2Controller(
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 }.build()
             }
-            runCatching {
-                currentSession.captureBurst(requests, burstCallback, cameraHandler)
-            }.onFailure { abortCapture("RAW burst failed", it) }
+            runCatching { currentSession.captureBurst(requests, burstCallback, cameraHandler) }
+                .onFailure { abortCapture("RAW burst failed", it) }
 
             cameraHandler.postDelayed({
                 if (captureExpected > 0) abortCapture("RAW burst timed out")
@@ -232,17 +234,23 @@ class Camera2Controller(
                     }
                 }
             }, cameraHandler)
-        }.onFailure {
-            openRouteCandidates(lens, routes, token)
-        }
+        }.onFailure { openRouteCandidates(lens, routes, token) }
     }
 
-    private fun configureSession(lens: CanonicalLens, route: CameraRoute, remainingRoutes: Iterator<CameraRoute>, token: Long) {
+    private fun configureSession(
+        lens: CanonicalLens,
+        route: CameraRoute,
+        remainingRoutes: Iterator<CameraRoute>,
+        token: Long,
+    ) {
         val camera = device ?: return
         val texture = textureView ?: return
+        val host = texture.parent as? View
+        val viewWidth = host?.width?.takeIf { it > 0 } ?: texture.width
+        val viewHeight = host?.height?.takeIf { it > 0 } ?: texture.height
         val sensorRatio = route.rawSizes.firstOrNull()?.let { it.width.toFloat() / it.height }
             ?: route.previewSizes.firstOrNull()?.let { it.width.toFloat() / it.height }
-        val previewSize = PreviewGeometry.chooseSize(route.previewSizes, texture.width, texture.height, sensorRatio, aspectMode)
+        val previewSize = PreviewGeometry.chooseSize(route.previewSizes, viewWidth, viewHeight, sensorRatio, aspectMode)
         currentPreviewSize = previewSize
         val surfaceTexture: SurfaceTexture = texture.surfaceTexture ?: run {
             reportError("Preview surface is unavailable")
@@ -277,8 +285,20 @@ class Camera2Controller(
                     }
                     session = configured
                     activeRoute = route
-                    startRepeating(configured, camera, route)
-                    mainHandler.post { listener.onRouteOpened(lens, route) }
+                    startRepeating(configured, camera)
+                    mainHandler.post {
+                        if (previewMode == PreviewMode.API) {
+                            PreviewGeometry.applyTextureTransform(
+                                texture,
+                                previewSize,
+                                route.sensorOrientation,
+                                displayRotation,
+                                route.facing,
+                                mirrorFront,
+                            )
+                        }
+                        listener.onRouteOpened(lens, route)
+                    }
                 }
             }
 
@@ -296,18 +316,20 @@ class Camera2Controller(
                 val outputs = surfaces.map { surface ->
                     OutputConfiguration(surface).apply { setPhysicalCameraId(route.physicalId) }
                 }
-                camera.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, sessionExecutor, callback))
+                camera.createCaptureSession(
+                    SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, sessionExecutor, callback),
+                )
             } else {
                 @Suppress("DEPRECATION")
                 camera.createCaptureSession(surfaces, callback, cameraHandler)
             }
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             closeSessionPiecesForRetry()
             openRouteCandidates(lens, remainingRoutes, token)
         }
     }
 
-    private fun startRepeating(configured: CameraCaptureSession, camera: CameraDevice, route: CameraRoute) {
+    private fun startRepeating(configured: CameraCaptureSession, camera: CameraDevice) {
         val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
         when (previewMode) {
             PreviewMode.API -> previewSurface?.let(builder::addTarget)
@@ -319,21 +341,34 @@ class Camera2Controller(
     }
 
     private val previewCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
             latestExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
             latestIso = result.get(CaptureResult.SENSOR_SENSITIVITY)
-            mainHandler.post { listener.onPreviewCaptureState(latestExposureNs, latestIso) }
+            val focal = result.get(CaptureResult.LENS_FOCAL_LENGTH)
+            mainHandler.post { listener.onPreviewCaptureState(latestExposureNs, latestIso, focal) }
         }
     }
 
     private val burstCallback = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             pendingResults[timestamp] = result
             tryPair(timestamp)
         }
 
-        override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: android.hardware.camera2.CaptureFailure,
+        ) {
             abortCapture("One RAW burst frame failed")
         }
     }
@@ -403,12 +438,23 @@ class Camera2Controller(
                     cfa = route.cfa ?: 0,
                 )
                 val reference = frames[outcome.referenceIndex].result
-                val uri = DngOutputWriter.write(context, characteristics, reference, size, outcome.output, captureOrientation)
+                val uri = DngOutputWriter.write(
+                    context,
+                    characteristics,
+                    reference,
+                    size,
+                    outcome.output,
+                    captureOrientation,
+                )
                 mainHandler.post {
-                    if (generationAtSubmit <= generation) listener.onCaptureCompleted(uri, outcome.acceptedFrames)
+                    if (generationAtSubmit == generation) {
+                        listener.onCaptureCompleted(uri, outcome.acceptedFrames)
+                    }
                 }
             } catch (t: Throwable) {
-                mainHandler.post { listener.onError("RAW merge/DNG write failed", t) }
+                mainHandler.post {
+                    if (generationAtSubmit == generation) listener.onError("RAW merge/DNG write failed", t)
+                }
             }
         }
         if (expected <= 0) reportError("Capture finished without frames")
@@ -418,8 +464,10 @@ class Camera2Controller(
         val route = activeRoute ?: return
         val view = rawPreviewView ?: return
         val plane = image.planes.firstOrNull() ?: return
-        val width = minOf(view.width.coerceAtLeast(320), 960)
-        val height = minOf(view.height.coerceAtLeast(240), 720)
+        val outWidth = 960.coerceAtMost(image.width.coerceAtLeast(1))
+        val outHeight = ((outWidth.toLong() * image.height) / image.width.coerceAtLeast(1))
+            .toInt()
+            .coerceIn(240, 960)
         val raw = plane.buffer.duplicate()
         if (!raw.isDirect) return
         val pixels = runCatching {
@@ -429,16 +477,24 @@ class Camera2Controller(
                 image.height,
                 plane.rowStride,
                 plane.pixelStride,
-                width,
-                height,
+                outWidth,
+                outHeight,
                 route.blackLevels,
                 route.whiteLevel ?: 65535,
                 route.cfa ?: 0,
             )
         }.getOrNull() ?: return
-        val bitmap = Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
         mainHandler.post {
             view.setImageBitmap(bitmap)
+            PreviewGeometry.applyViewTransform(
+                view,
+                Size(outWidth, outHeight),
+                route.sensorOrientation,
+                displayRotation,
+                route.facing,
+                mirrorFront,
+            )
             listener.onRawPreviewFrame()
         }
     }
