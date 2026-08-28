@@ -36,9 +36,12 @@ import com.sahidcode404.camera.core.raw.DngOutputWriter
 import com.sahidcode404.camera.core.raw.FramePlanner
 import com.sahidcode404.camera.core.raw.LensBurstBounds
 import com.sahidcode404.camera.core.raw.NativeRawMerger
+import com.sahidcode404.camera.core.raw.RawBurstTimeoutPolicy
+import com.sahidcode404.camera.core.raw.RawTimestampPairingPolicy
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.TreeMap
+import java.util.concurrent.CancellationException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.math.pow
@@ -64,6 +67,11 @@ class Camera2Controller(
         val iso: Int,
     )
 
+    private data class BurstRequestTag(
+        val generation: Long,
+        val captureId: Long,
+    )
+
     private val manager = context.getSystemService(CameraManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cameraThread = HandlerThread("CameraOwner").apply { start() }
@@ -72,8 +80,9 @@ class Camera2Controller(
         Thread(r, "RawProcessing").apply { priority = Thread.NORM_PRIORITY - 1 }
     }
     private val sessionExecutor = Executor { command -> cameraHandler.post(command) }
+    private val generationGuard = Any()
 
-    private var generation = 0L
+    @Volatile private var generation = 0L
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var rawReader: ImageReader? = null
@@ -91,7 +100,14 @@ class Camera2Controller(
     private var latestExposureNs: Long? = null
     private var latestIso: Int? = null
 
+    private var nextCaptureId = 0L
+    private var activeCaptureId = 0L
+    private var captureGeneration = 0L
     private var captureExpected = 0
+    private var captureMinimum = 0
+    private var captureCompletedCallbacks = 0
+    private var captureFailedCallbacks = 0
+    private var capturePausedRawPreview = false
     private val pendingImages = TreeMap<Long, ByteBuffer>()
     private val pendingResults = TreeMap<Long, TotalCaptureResult>()
     private val captured = mutableListOf<CapturedRaw>()
@@ -107,8 +123,7 @@ class Camera2Controller(
         displayRotation: Int,
     ) {
         cameraHandler.post {
-            generation += 1
-            val token = generation
+            val token = advanceGeneration()
             closeOwned()
             textureView = texture
             rawPreviewView = rawView
@@ -122,14 +137,14 @@ class Camera2Controller(
 
     fun close() {
         cameraHandler.post {
-            generation += 1
+            advanceGeneration()
             closeOwned()
         }
     }
 
     fun shutdown() {
         cameraHandler.post {
-            generation += 1
+            advanceGeneration()
             closeOwned()
             processing.shutdown()
             cameraThread.quitSafely()
@@ -146,50 +161,79 @@ class Camera2Controller(
             if (captureExpected > 0) return@post
 
             val memoryMax = BurstMemoryBudget.maxFrames(context, rawSize, bounds.maxFrames)
+            val minimum = bounds.minFrames.coerceAtMost(memoryMax).coerceAtLeast(2)
             val plan = FramePlanner.plan(
                 latestExposureNs,
                 latestIso,
-                bounds.minFrames.coerceAtMost(memoryMax),
+                minimum,
                 memoryMax,
                 route.supportsManualSensor,
             )
+
+            nextCaptureId += 1L
+            val captureId = nextCaptureId
+            val token = generation
+            activeCaptureId = captureId
+            captureGeneration = token
             captureExpected = plan.frameCount
+            captureMinimum = minimum.coerceAtMost(plan.frameCount)
+            captureCompletedCallbacks = 0
+            captureFailedCallbacks = 0
+            capturePausedRawPreview = false
             captureOrientation = orientation
             pendingImages.clear()
             pendingResults.clear()
             captured.clear()
-            mainHandler.post { listener.onCaptureStarted(plan.frameCount) }
+            mainHandler.post {
+                if (token == generation) listener.onCaptureStarted(plan.frameCount)
+            }
 
             val characteristics = currentCharacteristics ?: return@post abortCapture("Missing camera characteristics")
             val exposureRange: Range<Long>? = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val isoRange: Range<Int>? = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             val baseExposure = latestExposureNs
             val baseIso = latestIso
+            val manualPlan = route.supportsManualSensor && baseExposure != null && baseIso != null && exposureRange != null && isoRange != null
+            val plannedExposureNs = ArrayList<Long>(plan.frameCount)
+
             val requests = plan.evOffsets.map { ev ->
                 currentDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     addTarget(reader.surface)
                     if (previewMode == PreviewMode.API) previewSurface?.let(::addTarget)
-                    if (
-                        route.supportsManualSensor && baseExposure != null && baseIso != null &&
-                        exposureRange != null && isoRange != null
-                    ) {
+                    if (manualPlan) {
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                        val scaled = (baseExposure * 2.0.pow(ev.toDouble())).toLong()
-                            .coerceIn(exposureRange.lower, exposureRange.upper)
+                        val scaled = (baseExposure!! * 2.0.pow(ev.toDouble())).toLong()
+                            .coerceIn(exposureRange!!.lower, exposureRange.upper)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, scaled)
-                        set(CaptureRequest.SENSOR_SENSITIVITY, baseIso.coerceIn(isoRange.lower, isoRange.upper))
+                        set(CaptureRequest.SENSOR_SENSITIVITY, baseIso!!.coerceIn(isoRange!!.lower, isoRange.upper))
+                        plannedExposureNs += scaled
                     } else {
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                        plannedExposureNs += baseExposure ?: 10_000_000L
                     }
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    setTag(BurstRequestTag(token, captureId))
                 }.build()
             }
-            runCatching { currentSession.captureBurst(requests, burstCallback, cameraHandler) }
-                .onFailure { abortCapture("RAW burst failed", it) }
 
+            if (previewMode == PreviewMode.RAW) {
+                capturePausedRawPreview = runCatching {
+                    currentSession.stopRepeating()
+                    true
+                }.getOrDefault(false)
+            }
+
+            val submitted = runCatching {
+                currentSession.captureBurst(requests, burstCallback, cameraHandler)
+            }.onFailure {
+                abortCapture("RAW burst failed", it)
+            }.isSuccess
+            if (!submitted) return@post
+
+            val timeoutMs = RawBurstTimeoutPolicy.timeoutMs(plannedExposureNs, plan.frameCount)
             cameraHandler.postDelayed({
-                if (captureExpected > 0) abortCapture("RAW burst timed out")
-            }, 8_000L)
+                if (isCaptureActive(captureId, token)) handleCaptureTimeout()
+            }, timeoutMs)
         }
     }
 
@@ -287,6 +331,7 @@ class Camera2Controller(
                     activeRoute = route
                     startRepeating(configured, camera)
                     mainHandler.post {
+                        if (token != generation) return@post
                         if (previewMode == PreviewMode.API) {
                             PreviewGeometry.applyTextureTransform(
                                 texture,
@@ -346,10 +391,16 @@ class Camera2Controller(
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
+            if (session !== this@Camera2Controller.session) return
+            val token = generation
             latestExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
             latestIso = result.get(CaptureResult.SENSOR_SENSITIVITY)
             val focal = result.get(CaptureResult.LENS_FOCAL_LENGTH)
-            mainHandler.post { listener.onPreviewCaptureState(latestExposureNs, latestIso, focal) }
+            val exposure = latestExposureNs
+            val iso = latestIso
+            mainHandler.post {
+                if (token == generation) listener.onPreviewCaptureState(exposure, iso, focal)
+            }
         }
     }
 
@@ -359,9 +410,19 @@ class Camera2Controller(
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
-            val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+            if (session !== this@Camera2Controller.session) return
+            if (activeBurstTag(request) == null) return
+            val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+            if (timestamp == null) {
+                captureFailedCallbacks += 1
+                maybeFinishCapture()
+                return
+            }
+            captureCompletedCallbacks += 1
             pendingResults[timestamp] = result
-            tryPair(timestamp)
+            while (pendingResults.size > captureExpected + 4) pendingResults.pollFirstEntry()
+            tryPairFromResult(timestamp)
+            maybeFinishCapture()
         }
 
         override fun onCaptureFailed(
@@ -369,7 +430,10 @@ class Camera2Controller(
             request: CaptureRequest,
             failure: android.hardware.camera2.CaptureFailure,
         ) {
-            abortCapture("One RAW burst frame failed")
+            if (session !== this@Camera2Controller.session) return
+            if (activeBurstTag(request) == null) return
+            captureFailedCallbacks += 1
+            maybeFinishCapture()
         }
     }
 
@@ -381,7 +445,7 @@ class Camera2Controller(
                     val timestamp = image.timestamp
                     pendingImages[timestamp] = packRaw(image)
                     while (pendingImages.size > captureExpected + 4) pendingImages.pollFirstEntry()
-                    tryPair(timestamp)
+                    tryPairFromImage(timestamp)
                     if (previewMode == PreviewMode.RAW) renderRawPreview(image)
                 } finally {
                     image.close()
@@ -402,31 +466,83 @@ class Camera2Controller(
         }
     }
 
-    private fun tryPair(timestamp: Long) {
-        val image = pendingImages[timestamp] ?: return
-        val result = pendingResults[timestamp] ?: return
-        pendingImages.remove(timestamp)
-        pendingResults.remove(timestamp)
+    private fun activeBurstTag(request: CaptureRequest): BurstRequestTag? {
+        val tag = request.tag as? BurstRequestTag ?: return null
+        return tag.takeIf { isCaptureActive(it.captureId, it.generation) }
+    }
+
+    private fun isCaptureActive(captureId: Long, token: Long): Boolean =
+        captureExpected > 0 &&
+            activeCaptureId == captureId &&
+            captureGeneration == token &&
+            generation == token
+
+    private fun tryPairFromImage(imageTimestamp: Long) {
+        if (!pendingImages.containsKey(imageTimestamp)) return
+        val resultTimestamp = RawTimestampPairingPolicy.match(imageTimestamp, pendingResults.keys) ?: return
+        consumePair(imageTimestamp, resultTimestamp)
+    }
+
+    private fun tryPairFromResult(resultTimestamp: Long) {
+        if (!pendingResults.containsKey(resultTimestamp)) return
+        val imageTimestamp = RawTimestampPairingPolicy.match(resultTimestamp, pendingImages.keys) ?: return
+        consumePair(imageTimestamp, resultTimestamp)
+    }
+
+    private fun consumePair(imageTimestamp: Long, resultTimestamp: Long) {
+        val image = pendingImages.remove(imageTimestamp) ?: return
+        val result = pendingResults.remove(resultTimestamp) ?: return
         val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: latestExposureNs ?: 10_000_000L
         val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: latestIso ?: 100
-        captured += CapturedRaw(timestamp, image, result, exposure, iso)
-        if (captured.size >= captureExpected && captureExpected > 0) finishCapture()
+        captured += CapturedRaw(resultTimestamp, image, result, exposure, iso)
+        maybeFinishCapture()
+    }
+
+    private fun maybeFinishCapture() {
+        if (captureExpected <= 0) return
+        if (captured.size >= captureExpected) {
+            finishCapture()
+            return
+        }
+        val terminalCallbacks = captureCompletedCallbacks + captureFailedCallbacks
+        if (terminalCallbacks < captureExpected) return
+        if (captured.size < captureCompletedCallbacks) return
+
+        if (captured.size >= captureMinimum) {
+            finishCapture()
+        } else {
+            abortCapture("RAW burst produced only ${captured.size} usable frames; ${captureMinimum} required")
+        }
+    }
+
+    private fun handleCaptureTimeout() {
+        if (captureExpected <= 0) return
+        if (captured.size >= captureMinimum) {
+            finishCapture()
+        } else {
+            abortCapture("RAW burst timed out with ${captured.size} usable frames; ${captureMinimum} required")
+        }
     }
 
     private fun finishCapture() {
         val frames = captured.toList().sortedBy { it.timestamp }
-        val expected = captureExpected
-        captureExpected = 0
-        pendingImages.clear()
-        pendingResults.clear()
-        captured.clear()
-        val route = activeRoute ?: return
-        val size = currentRawSize ?: return
-        val characteristics = currentCharacteristics ?: return
-        val generationAtSubmit = generation
+        if (frames.isEmpty()) {
+            abortCapture("Capture finished without usable RAW frames")
+            return
+        }
+        val route = activeRoute ?: return abortCapture("Active route disappeared during capture")
+        val size = currentRawSize ?: return abortCapture("RAW size disappeared during capture")
+        val characteristics = currentCharacteristics ?: return abortCapture("Camera characteristics disappeared during capture")
+        val generationAtSubmit = captureGeneration
+        val orientationAtSubmit = captureOrientation
+        val shouldResumeRawPreview = capturePausedRawPreview
+
+        clearCaptureState()
+        if (shouldResumeRawPreview) resumeRawPreview()
 
         processing.execute {
             try {
+                if (generationAtSubmit != generation) return@execute
                 val outcome = NativeRawMerger.mergePackedRaw(
                     frames = frames.map { it.bytes }.toTypedArray(),
                     width = size.width,
@@ -437,6 +553,7 @@ class Camera2Controller(
                     whiteLevel = route.whiteLevel ?: 65535,
                     cfa = route.cfa ?: 0,
                 )
+                if (generationAtSubmit != generation) return@execute
                 val reference = frames[outcome.referenceIndex].result
                 val uri = DngOutputWriter.write(
                     context,
@@ -444,20 +561,30 @@ class Camera2Controller(
                     reference,
                     size,
                     outcome.output,
-                    captureOrientation,
+                    orientationAtSubmit,
+                    commitGuard = { publish -> commitIfGenerationCurrent(generationAtSubmit, publish) },
                 )
                 mainHandler.post {
                     if (generationAtSubmit == generation) {
                         listener.onCaptureCompleted(uri, outcome.acceptedFrames)
                     }
                 }
+            } catch (_: CancellationException) {
+                // A lens/session generation superseded this background job before publication.
             } catch (t: Throwable) {
                 mainHandler.post {
                     if (generationAtSubmit == generation) listener.onError("RAW merge/DNG write failed", t)
                 }
             }
         }
-        if (expected <= 0) reportError("Capture finished without frames")
+    }
+
+    private fun resumeRawPreview() {
+        if (previewMode != PreviewMode.RAW) return
+        val configured = session ?: return
+        val camera = device ?: return
+        runCatching { startRepeating(configured, camera) }
+            .onFailure { reportError("RAW preview could not resume after capture", it) }
     }
 
     private fun renderRawPreview(image: Image) {
@@ -485,7 +612,9 @@ class Camera2Controller(
             )
         }.getOrNull() ?: return
         val bitmap = Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        val token = generation
         mainHandler.post {
+            if (token != generation) return@post
             view.setImageBitmap(bitmap)
             PreviewGeometry.applyViewTransform(
                 view,
@@ -516,14 +645,27 @@ class Camera2Controller(
     }
 
     private fun abortCapture(message: String, throwable: Throwable? = null) {
-        captureExpected = 0
-        pendingImages.clear()
-        pendingResults.clear()
-        captured.clear()
+        val shouldResumeRawPreview = capturePausedRawPreview
+        clearCaptureState()
+        if (shouldResumeRawPreview) resumeRawPreview()
         reportError(message, throwable)
     }
 
+    private fun clearCaptureState() {
+        captureExpected = 0
+        captureMinimum = 0
+        captureCompletedCallbacks = 0
+        captureFailedCallbacks = 0
+        capturePausedRawPreview = false
+        activeCaptureId = 0L
+        captureGeneration = 0L
+        pendingImages.clear()
+        pendingResults.clear()
+        captured.clear()
+    }
+
     private fun closeSessionPiecesForRetry() {
+        clearCaptureState()
         runCatching { session?.close() }
         session = null
         runCatching { rawReader?.close() }
@@ -532,13 +674,14 @@ class Camera2Controller(
         previewSurface = null
         runCatching { device?.close() }
         device = null
+        activeRoute = null
+        currentPreviewSize = null
+        currentRawSize = null
+        currentCharacteristics = null
     }
 
     private fun closeOwned() {
-        captureExpected = 0
-        pendingImages.clear()
-        pendingResults.clear()
-        captured.clear()
+        clearCaptureState()
         runCatching { session?.stopRepeating() }
         runCatching { session?.abortCaptures() }
         runCatching { session?.close() }
@@ -550,7 +693,25 @@ class Camera2Controller(
         runCatching { device?.close() }
         device = null
         activeRoute = null
+        currentPreviewSize = null
+        currentRawSize = null
         currentCharacteristics = null
+        latestExposureNs = null
+        latestIso = null
+    }
+
+    private fun advanceGeneration(): Long = synchronized(generationGuard) {
+        generation += 1L
+        generation
+    }
+
+    private fun commitIfGenerationCurrent(token: Long, action: () -> Unit): Boolean = synchronized(generationGuard) {
+        if (token != generation) {
+            false
+        } else {
+            action()
+            true
+        }
     }
 
     private fun reportError(message: String, throwable: Throwable? = null) {

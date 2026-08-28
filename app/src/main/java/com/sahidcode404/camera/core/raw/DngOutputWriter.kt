@@ -20,6 +20,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CancellationException
 
 object DngOutputWriter {
     fun write(
@@ -29,50 +30,125 @@ object DngOutputWriter {
         size: Size,
         packedRaw: ByteBuffer,
         orientation: Int,
+        commitGuard: ((() -> Unit) -> Boolean)? = null,
     ): Uri {
         val name = "IMG_${SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())}.dng"
         return if (Build.VERSION.SDK_INT >= 29) {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
-                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-            val uri = requireNotNull(context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values))
-            try {
-                context.contentResolver.openOutputStream(uri, "w")!!.use { stream ->
-                    DngCreator(characteristics, captureResult).use { dng ->
-                        dng.setOrientation(orientation)
-                        packedRaw.rewind()
-                        dng.writeByteBuffer(stream, size, packedRaw, 0L)
-                    }
-                }
-                context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-                uri
-            } catch (t: Throwable) {
-                context.contentResolver.delete(uri, null, null)
-                throw t
-            }
+            writeScoped(
+                context,
+                characteristics,
+                captureResult,
+                size,
+                packedRaw,
+                orientation,
+                name,
+                commitGuard,
+            )
         } else {
-            val publicAllowed = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-            val directory = if (publicAllowed) {
-                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
-            } else {
-                File(requireNotNull(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)), "Camera")
-            }
-            check(directory.exists() || directory.mkdirs()) { "Cannot create Camera output directory" }
-            val file = File(directory, name)
-            FileOutputStream(file).use { stream ->
+            writeLegacy(
+                context,
+                characteristics,
+                captureResult,
+                size,
+                packedRaw,
+                orientation,
+                name,
+                commitGuard,
+            )
+        }
+    }
+
+    private fun writeScoped(
+        context: Context,
+        characteristics: CameraCharacteristics,
+        captureResult: TotalCaptureResult,
+        size: Size,
+        packedRaw: ByteBuffer,
+        orientation: Int,
+        name: String,
+        commitGuard: ((() -> Unit) -> Boolean)?,
+    ): Uri {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val uri = requireNotNull(context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values))
+        try {
+            context.contentResolver.openOutputStream(uri, "w")!!.use { stream ->
                 DngCreator(characteristics, captureResult).use { dng ->
                     dng.setOrientation(orientation)
                     packedRaw.rewind()
                     dng.writeByteBuffer(stream, size, packedRaw, 0L)
                 }
             }
-            if (publicAllowed) {
-                MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), arrayOf("image/x-adobe-dng"), null)
+            commitOrCancel(commitGuard) {
+                context.contentResolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                    null,
+                    null,
+                )
             }
-            Uri.fromFile(file)
+            return uri
+        } catch (t: Throwable) {
+            context.contentResolver.delete(uri, null, null)
+            throw t
         }
+    }
+
+    private fun writeLegacy(
+        context: Context,
+        characteristics: CameraCharacteristics,
+        captureResult: TotalCaptureResult,
+        size: Size,
+        packedRaw: ByteBuffer,
+        orientation: Int,
+        name: String,
+        commitGuard: ((() -> Unit) -> Boolean)?,
+    ): Uri {
+        val publicAllowed = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        val directory = if (publicAllowed) {
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
+        } else {
+            File(requireNotNull(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)), "Camera")
+        }
+        check(directory.exists() || directory.mkdirs()) { "Cannot create Camera output directory" }
+
+        val staged = File(directory, ".$name.pending")
+        val final = File(directory, name)
+        if (staged.exists()) staged.delete()
+        try {
+            FileOutputStream(staged).use { stream ->
+                DngCreator(characteristics, captureResult).use { dng ->
+                    dng.setOrientation(orientation)
+                    packedRaw.rewind()
+                    dng.writeByteBuffer(stream, size, packedRaw, 0L)
+                }
+            }
+            commitOrCancel(commitGuard) {
+                if (final.exists()) check(final.delete()) { "Cannot replace existing DNG" }
+                check(staged.renameTo(final)) { "Cannot publish staged DNG" }
+            }
+            if (publicAllowed) {
+                MediaScannerConnection.scanFile(context, arrayOf(final.absolutePath), arrayOf("image/x-adobe-dng"), null)
+            }
+            return Uri.fromFile(final)
+        } catch (t: Throwable) {
+            staged.delete()
+            throw t
+        }
+    }
+
+    private fun commitOrCancel(
+        commitGuard: ((() -> Unit) -> Boolean)?,
+        action: () -> Unit,
+    ) {
+        val committed = commitGuard?.invoke(action) ?: run {
+            action()
+            true
+        }
+        if (!committed) throw CancellationException("DNG publication cancelled by stale camera generation")
     }
 }
